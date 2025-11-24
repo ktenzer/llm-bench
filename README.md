@@ -385,8 +385,152 @@ python benchmark.py \
 | `--plot` | Generate visualization | Off | No |
 | `--output` | JSON results file | `benchmark_qps_results.json` | No |
 | `--plot-output` | PNG visualization file | `benchmark_qps.png` | No |
+| `--gpu-rate` | GPU cost per hour (e.g., 2.30) | None | No |
+| `--num-gpus` | Number of GPUs used | None | No |
 
 **Note:** Output files are automatically placed in timestamped directories under `results/`. You don't need to worry about overwriting previous results.
+
+### Cost Calculation
+
+To calculate cost per million tokens, provide both `--gpu-rate` and `--num-gpus`:
+
+```bash
+python benchmark.py \
+    --endpoint "https://api.example.com/v1/chat/completions" \
+    --api-key "sk-xxxx" \
+    --model "meta-llama/Llama-3.1-8B-Instruct" \
+    --dataset conversations.json \
+    --qps 10,20,30 \
+    --duration 60 \
+    --gpu-rate 2.30 \
+    --num-gpus 2
+```
+
+**Cost Calculation Formula (Total Tokens - Input + Output):**
+
+The benchmark calculates cost based on **total aggregate throughput** (input + output tokens), because the GPU spends time on both:
+
+1. **Total tokens** = sum of ALL input + output tokens from successful requests
+2. **Aggregate throughput** = total_tokens / actual_duration_seconds  
+3. **Time to process 1M total tokens** = 1,000,000 / aggregate_throughput
+4. **GPU cost for 1M total tokens** = num_gpus × rate_per_hour × (time_for_1M / 3600)
+
+**Formula in code:**
+```
+GPU_rate × num_gpus × (1,000,000 / total_tokens_per_sec) / 3600
+```
+
+This gives you the **real cost per million total tokens**, accounting for actual GPU time spent on both prefill (input) and decode (output).
+
+**Example:**
+- Run: 30 seconds at 45 QPS
+- GPUs: 1 × $2.30/hour
+- Input tokens: 1,890,000
+- Output tokens: 225,000
+- Total tokens: 2,115,000
+- Aggregate throughput: 2,115,000 / 30 = 70,500 total tokens/sec
+- Time for 1M total tokens: 1,000,000 / 70,500 = 14.18 seconds
+- GPU cost for 1M: 1 × 2.30 × (14.18/3600) = **$0.0091** per million total tokens
+
+**Why Count Both Input and Output?**
+- GPU time is spent on BOTH prefill (input) and decode (output) phases
+- Prefill: Processes all input tokens in parallel (fast but still uses GPU time)
+- Decode: Generates output tokens sequentially (slower, token-by-token)
+- Cost reflects total GPU runtime for processing all tokens
+- For production pricing, you typically charge for total tokens (like OpenAI does)
+
+**Why Does Cost Per Token Decrease at Higher QPS?**
+
+This is counter-intuitive but correct! Here's why:
+
+| QPS Level | GPU Utilization | Total Tok/Sec | Cost per 1M Tokens | Why |
+|-----------|-----------------|---------------|-------------------|-----|
+| **5 QPS**  | ~10% (mostly idle) | 2,000 | $4.00 | GPU waits between requests |
+| **20 QPS** | ~50% (moderate) | 20,000 | $0.40 | Some request overlap |
+| **45 QPS** | ~90% (busy) | 70,000 | $0.01 | Continuous batched processing |
+
+**Key Insight:** You pay for GPU time whether it's busy or idle!
+
+- At low QPS: GPU processes request → idles 95% of time → next request
+- At high QPS: Requests overlap → GPU batches them → processes tokens continuously
+
+**Production Planning:**
+- ❌ DON'T use cost from low QPS (GPU underutilized, inflated cost)
+- ✅ DO use cost from highest QPS with ≥99% success (realistic utilization)
+
+**⚠️ Important Notes:**
+- Cost is calculated per million **TOTAL** tokens (input + output combined)
+- Both prefill (input) and decode (output) consume GPU time and contribute to cost
+- If success rate < 95%, the cost assumes you can sustain the measured throughput, but errors indicate you'd need MORE GPUs to reliably handle that rate
+- Higher QPS with errors means the single-GPU cost looks cheap, but you'd actually need more GPUs for production
+- Compare costs at the highest QPS with 99%+ success rate for most accurate production estimates
+
+**Cost is displayed in:**
+- ✅ Console table ($/M Tokens column)
+- ✅ JSON results (cost_analysis section)
+- ✅ Visualization graph (Cost per Million Tokens plot)
+
+### Finding Your Optimal Configuration
+
+To accurately determine cost per million tokens for production:
+
+**Step 1: Find Saturation Point**
+```bash
+# Test increasing QPS levels to find where errors start
+python benchmark.py \
+    --endpoint "https://your-endpoint.com" \
+    --api-key "your-key" \
+    --model "your-model" \
+    --dataset conversations.json \
+    --qps 5,10,15,20,25,30 \
+    --duration 60 \
+    --gpu-rate 2.30 \
+    --num-gpus 1
+```
+
+**Step 2: Identify Maximum Sustainable QPS**
+
+Look for the **highest QPS with ≥99% success rate**. Example output:
+
+```
+QPS 5.0:  ✅ PASS - 100% success, 2,000 total tok/s (~1% GPU util), $4.00/M   ← Too low!
+QPS 10.0: ✅ PASS - 100% success, 12,000 total tok/s (~15% GPU util), $0.67/M
+QPS 30.0: ✅ PASS - 99.5% success, 48,000 total tok/s (~60% GPU util), $0.17/M  ← Good!
+QPS 45.0: ✅ PASS - 99.8% success, 70,500 total tok/s (~88% GPU util), $0.01/M  ← Optimal!
+QPS 50.0: ⚠️  WARN - 92.1% success, 65,000 total tok/s, $0.013/M tokens  ← Saturated!
+QPS 60.0: ❌ FAIL - 45.2% success, 48,000 total tok/s, $0.018/M tokens  ← Overloaded!
+```
+
+✅ **Use QPS 45.0** for production cost estimates ($0.01/M total tokens with 1 GPU)
+
+**Why not use QPS 5.0 even though it's 100% success?**
+- The GPU is 99% idle, waiting for requests
+- You're paying $2.30/hour for a GPU that's barely working
+- Cost per token is artificially high due to underutilization
+- At 45 QPS, you get ~400x cheaper cost per token with the same GPU!
+
+**Step 3: Scale Calculation**
+
+If you need higher throughput than one GPU can sustain:
+
+| GPUs | Max Sustainable QPS | Total Tokens/sec | Cost/M Total Tokens | Total Throughput |
+|------|---------------------|------------------|---------------------|------------------|
+| 1    | 45 QPS              | 70,500           | $0.01               | 254M tok/hour   |
+| 2    | 90 QPS              | 141,000          | $0.01*              | 508M tok/hour   |
+| 4    | 180 QPS             | 282,000          | $0.01*              | 1,015M tok/hour |
+
+*Assuming linear scaling (test to verify!)
+
+**Step 4: Production Planning**
+
+```
+Your requirements: 100M tokens/day
+Sustained throughput needed: 100M / 24 hours = 4.17M tokens/hour
+
+From table above:
+- 1 GPU handles 18.8M/hour → Sufficient! ✅
+- Daily cost: (100M / 1M) × $0.16 = $16/day
+```
 
 ## Working with Results
 
@@ -428,10 +572,13 @@ High-resolution visualization with large, easy-to-read graphs showing:
 - **QPS and Success Rate** - Throughput vs target with success rate overlay
 - **TTFT Percentiles** - Time to first token (P50, P90, P95, P99)
 - **E2E Latency Percentiles** - End-to-end request latency (P50, P90, P95, P99)
-- **Tokens/sec Percentiles** - Generation speed (P50, P90, P95, P99) - **always shown**
+- **Generation Speed** - Dual y-axis showing:
+  - **Per-Request Tokens/sec** (P50, P90, P95, P99) - User-facing speed
+  - **Aggregate Throughput** (Purple line) - System capacity (total output tokens/sec)
+- **Cost per Million Tokens** - Shows when `--gpu-rate` and `--num-gpus` are provided
 - **Summary and Recommendations** - Optimal QPS, saturation point, guidance
 
-The graphs are sized for clarity (32x12 inches, wide format) with 3x2 layout. All metrics (TTFT, E2E, Tokens/sec) are always displayed in graphs.
+The graphs are sized for clarity (32x12 or 32x16 inches, wide format) with 3x2 layout (standard) or 4x2 layout (with cost). All metrics (TTFT, E2E, Tokens/sec) are always displayed in graphs.
 
 ### Comparing Results
 
@@ -481,6 +628,14 @@ QPS 20.0 - Errors (178 total):
   - HTTP 503: 145 occurrences
 ```
 
+**With Cost Calculation** (when `--gpu-rate` and `--num-gpus` are provided):
+
+```
+QPS Target   Actual QPS   Success%   TTFT P50(s)  E2E P50(s)   Tok/s P50    $/M Tokens  
+10.0         9.95         98.5       0.250        4.100        68.5         $0.0234     
+20.0         19.82        85.2       0.400        5.500        55.0         $0.0445     
+```
+
 ### Metrics Explained
 
 | Metric | Description | Good Value |
@@ -491,30 +646,65 @@ QPS 20.0 - Errors (178 total):
 | **TTFT** | Time to First Token | <0.5s for real-time |
 | **E2E Latency** | End-to-End request time | <5s for most models |
 | **Tokens/sec** | Generation speed | >50 for good performance |
+| **$/M Tokens** | Cost per million tokens | Depends on model/hardware |
 | **P50** | Median (50th percentile) | Typical performance |
 | **P90** | 90th percentile | Good performance |
 | **P95** | 95th percentile | SLA target |
 | **P99** | 99th percentile | Worst-case |
 
-### Understanding Tokens/sec
+### Understanding Tokens/sec: Two Different Metrics
 
-**Tokens per second** measures how fast your model generates output tokens:
+The benchmark tracks **two different tokens/sec metrics** that serve different purposes:
 
-- **Calculated as**: `output_tokens / total_request_time`
+#### 1. Per-Request Tokens/sec (Graph Percentiles: P50, P90, P95, P99)
+
+**What it measures**: How fast each individual request generates tokens.
+
+- **Calculated as**: `output_tokens / request_total_time` (for each request)
+- **Shown in graph**: Left y-axis with percentile distribution
 - **Typical values**:
-  - 7B models on H100: 80-150 tokens/sec
-  - 70B models on H100: 40-80 tokens/sec
+  - 7B models on H100: 80-150 tokens/sec per request
+  - 70B models on H100: 40-80 tokens/sec per request
 - **What affects it**:
   - Model size (larger = slower)
   - Input length (longer context = slower)
-  - Batch size and concurrency
-  - GPU utilization
+  - Queue wait time (if GPU is busy)
+  - Request-specific batching effects
 
-**Why it matters**: Tokens/sec directly impacts user experience for streaming responses. Lower tokens/sec means users wait longer to see each word appear.
+**Why it matters**: This is **user-facing latency** - each user sees tokens streaming at this speed. Lower per-request tokens/sec means users wait longer to see each word appear.
+
+**Example**: If P50 = 100 tok/s, half your users see tokens appearing at ≥100 tokens/sec.
+
+#### 2. Aggregate Sustained Throughput (Purple Line on Graph)
+
+**What it measures**: Total system output token generation rate across ALL concurrent requests.
+
+- **Calculated as**: `total_output_tokens / test_duration` (across all requests)
+- **Shown in graph**: Right y-axis, bold purple line
+- **Typical values**:
+  - 1 H100 with 8B model: 5,000-15,000 aggregate tokens/sec
+  - Scales with concurrent requests and GPU utilization
+- **What affects it**:
+  - Number of concurrent requests (QPS)
+  - GPU utilization (batching efficiency)
+  - Success rate (failures don't contribute)
+
+**Why it matters**: This is **system capacity** - how many total tokens your GPU generates per second. Used for capacity planning and cost calculations.
+
+**Example**: At 40 QPS with aggregate 10,000 tok/s, your GPU generates 10,000 output tokens every second across all concurrent requests.
+
+#### Key Difference
+
+```
+Per-Request (100 tok/s):  Each user sees ~100 tokens/sec streaming
+Aggregate (10,000 tok/s): System generates 10k tokens/sec total across 100 concurrent users
+
+Both are correct! One measures user experience, the other measures system capacity.
+```
 
 ### JSON Output
 
-Results are saved with all metrics including tokens/sec:
+Results are saved with all metrics including tokens/sec and cost (if calculated):
 
 ```json
 {
@@ -538,6 +728,13 @@ Results are saved with all metrics including tokens/sec:
     "p90": 72.1,
     "p95": 75.3,
     "p99": 80.2
+  },
+  "cost_analysis": {
+    "total_input_tokens": 245000,
+    "total_output_tokens": 155000,
+    "total_tokens": 400000,
+    "gpu_cost": 0.00935,
+    "cost_per_million_tokens": 0.0234
   },
   "errors": {"HTTP 503": 9}
 }

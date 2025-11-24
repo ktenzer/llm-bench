@@ -85,6 +85,7 @@ class RequestMetrics:
     ttft: Optional[float] = None
     total_time: Optional[float] = None
     status_code: Optional[int] = None
+    input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     error: Optional[str] = None
     timestamp: float = 0.0
@@ -116,6 +117,15 @@ class QPSResults:
     
     actual_qps: float = 0.0
     success_rate: float = 0.0
+    actual_duration: float = 0.0  # Actual time taken for the test
+    
+    # Cost calculation fields (optional)
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_tokens: int = 0
+    sustained_tokens_per_sec: float = 0.0  # Overall throughput
+    gpu_cost: float = 0.0
+    cost_per_million_tokens: float = 0.0
     
     error_counts: Dict[str, int] = field(default_factory=dict)
     status_codes: Dict[int, int] = field(default_factory=dict)
@@ -154,6 +164,12 @@ def prepare_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     return messages
 
 
+def estimate_input_tokens(messages: List[Dict[str, str]]) -> int:
+    """Estimate input tokens from messages (rough approximation: chars/4)."""
+    total_chars = sum(len(msg.get('content', '')) for msg in messages)
+    return max(1, total_chars // 4)
+
+
 async def send_request(
     session: aiohttp.ClientSession,
     endpoint: str,
@@ -181,6 +197,7 @@ async def send_request(
     start_time = time.time()
     ttft = None
     output_tokens = 0
+    input_tokens = None
     status_code = None
     
     try:
@@ -214,6 +231,15 @@ async def send_request(
                 
                 try:
                     chunk = json.loads(line)
+                    if not chunk:
+                        continue
+                    
+                    # Check for usage information (some APIs provide this)
+                    if 'usage' in chunk and chunk['usage'] is not None:
+                        if 'prompt_tokens' in chunk['usage']:
+                            input_tokens = chunk['usage']['prompt_tokens']
+                        if 'completion_tokens' in chunk['usage']:
+                            output_tokens = chunk['usage']['completion_tokens']
                     
                     if not first_token_received:
                         ttft = time.time() - start_time
@@ -221,7 +247,7 @@ async def send_request(
                     
                     if 'choices' in chunk and len(chunk['choices']) > 0:
                         delta = chunk['choices'][0].get('delta', {})
-                        if 'content' in delta and delta['content']:
+                        if delta and 'content' in delta and delta['content']:
                             output_tokens += 1
                 
                 except json.JSONDecodeError:
@@ -229,11 +255,16 @@ async def send_request(
             
             total_time = time.time() - start_time
             
+            # Estimate input tokens if not provided
+            if input_tokens is None:
+                input_tokens = estimate_input_tokens(messages)
+            
             return RequestMetrics(
                 success=True,
                 ttft=ttft,
                 total_time=total_time,
                 status_code=200,
+                input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 timestamp=start_time
             )
@@ -263,9 +294,12 @@ async def run_qps_test(
     duration: int = 60,
     max_tokens: int = 512,
     temperature: float = 0.7,
+    gpu_rate: Optional[float] = None,
+    num_gpus: Optional[int] = None,
 ) -> QPSResults:
     """
     Run QPS test - send requests at specified rate for given duration.
+    Optionally calculates cost per million tokens if gpu_rate and num_gpus are provided.
     """
     
     print(f"\n{'='*80}")
@@ -401,10 +435,45 @@ async def run_qps_test(
         results_obj.tokens_per_sec_p95 = safe_percentile(tokens_per_sec_values, 95)
         results_obj.tokens_per_sec_p99 = safe_percentile(tokens_per_sec_values, 99)
     
+    # Store actual duration
+    results_obj.actual_duration = actual_duration
+    
+    # Calculate cost per million tokens if GPU parameters provided
+    if gpu_rate is not None and num_gpus is not None:
+        # Count total tokens (input + output) from successful requests
+        total_input = sum(r.input_tokens or 0 for r in successful_results)
+        total_output = sum(r.output_tokens or 0 for r in successful_results)
+        total_tokens = total_input + total_output
+        
+        if total_tokens > 0:
+            # Calculate aggregate throughput for ALL tokens (input + output)
+            # Cost is based on total GPU time, which includes:
+            # - Prefill phase: processing input tokens
+            # - Decode phase: generating output tokens
+            total_tokens_per_second = total_tokens / actual_duration
+            
+            # Calculate time needed to process 1M TOTAL tokens at this sustained rate
+            seconds_for_1m_tokens = 1_000_000 / total_tokens_per_second
+            
+            # Calculate GPU cost for processing 1M total tokens at this rate
+            # Formula: GPU_rate * num_gpus * (time_in_hours)
+            gpu_cost_for_1m = num_gpus * gpu_rate * (seconds_for_1m_tokens / 3600.0)
+            
+            # Also track output-only throughput for system capacity metrics
+            output_tokens_per_second = total_output / actual_duration if total_output > 0 else 0
+            
+            # Store detailed cost analysis
+            results_obj.total_input_tokens = total_input
+            results_obj.total_output_tokens = total_output
+            results_obj.total_tokens = total_tokens
+            results_obj.sustained_tokens_per_sec = output_tokens_per_second  # Output only for capacity planning
+            results_obj.gpu_cost = num_gpus * gpu_rate * (actual_duration / 3600.0)  # Cost for this run
+            results_obj.cost_per_million_tokens = gpu_cost_for_1m
+    
     return results_obj
 
 
-def print_results_table(all_results: List[QPSResults], percentiles: List[int] = [50, 95, 99], show_tokens: bool = False):
+def print_results_table(all_results: List[QPSResults], percentiles: List[int] = [50, 95, 99], show_cost: bool = False):
     """Print results in a formatted table with selected percentiles. Always includes tokens/sec."""
     
     # Build header dynamically based on selected percentiles
@@ -422,6 +491,10 @@ def print_results_table(all_results: List[QPSResults], percentiles: List[int] = 
     # Always show tokens/sec
     for p in percentiles:
         percentile_cols.append((f'Tok/s P{p}', 12))
+    
+    # Add cost column if cost was calculated
+    if show_cost:
+        percentile_cols.append(('$/M Tokens', 12))
     
     all_cols = base_cols + percentile_cols
     total_width = sum(width for _, width in all_cols) + len(all_cols) - 1
@@ -459,9 +532,70 @@ def print_results_table(all_results: List[QPSResults], percentiles: List[int] = 
             val = getattr(result, f'tokens_per_sec_p{p}', 0.0)
             row_parts.append(f"{val:.1f}".ljust(12))
         
+        # Cost per million tokens (if calculated)
+        if show_cost:
+            cost = result.cost_per_million_tokens
+            if cost > 0:
+                row_parts.append(f"${cost:.4f}".ljust(12))
+            else:
+                row_parts.append("N/A".ljust(12))
+        
         print(" ".join(row_parts))
     
     print("="*total_width)
+    
+    # Print cost analysis context if cost was calculated
+    if any(r.cost_per_million_tokens is not None and r.cost_per_million_tokens > 0 for r in all_results):
+        print("\n" + "="*total_width)
+        print("COST ANALYSIS NOTES".center(total_width))
+        print("="*total_width)
+        
+        for result in all_results:
+            if result.cost_per_million_tokens and result.cost_per_million_tokens > 0:
+                # Calculate total tokens/sec for cost calculation
+                total_tokens_per_sec = result.total_tokens / result.actual_duration if result.actual_duration > 0 else 0
+                time_for_1m_total = (1_000_000 / total_tokens_per_sec) if total_tokens_per_sec > 0 else 0
+                
+                # Output tokens/sec for capacity planning
+                output_tokens_per_sec = result.sustained_tokens_per_sec
+                
+                # Calculate GPU utilization estimate based on output generation
+                # Rough estimate: H100 can do ~10k-15k output tokens/sec at full utilization for 8B models
+                estimated_max_throughput = 12000  # Conservative estimate for 8B model
+                gpu_utilization = min(100, (output_tokens_per_sec / estimated_max_throughput) * 100)
+                
+                print(f"\nQPS {result.qps_target} ({result.success_rate:.1f}% success):")
+                print(f"  • Input tokens: {result.total_input_tokens:,} | Output tokens: {result.total_output_tokens:,}")
+                print(f"  • Total tokens processed: {result.total_tokens:,}")
+                print(f"  • Aggregate throughput: {total_tokens_per_sec:,.1f} total tokens/sec")
+                print(f"  • Output generation rate: {output_tokens_per_sec:,.1f} output tokens/sec")
+                print(f"  • Estimated GPU utilization: ~{gpu_utilization:.0f}%")
+                print(f"  • Time to process 1M total tokens: {time_for_1m_total/60:.1f} minutes")
+                print(f"  • Cost per 1M total tokens: ${result.cost_per_million_tokens:.4f}")
+                
+                # Add efficiency notes
+                if gpu_utilization < 20:
+                    print(f"  💡 GPU mostly idle - cost/token is high. Increase QPS for better efficiency.")
+                elif gpu_utilization < 50:
+                    print(f"  💡 GPU underutilized - you could handle more load on this GPU.")
+                
+                # Add warnings
+                if result.success_rate < 95:
+                    print(f"  ⚠️  WARNING: {result.success_rate:.1f}% success rate - system may be saturated!")
+                    print(f"      Cost assumes you can sustain {total_tokens_per_sec:,.0f} tok/s, but errors indicate")
+                    print(f"      you'd need MORE GPUs to reliably process at this rate.")
+                elif result.success_rate < 99:
+                    print(f"  ⚠️  Note: {result.success_rate:.1f}% success rate - some request failures")
+        
+        print("\n" + "="*total_width)
+        print("💡 KEY INSIGHTS:")
+        print("    • Cost per token DECREASES as QPS increases (higher GPU utilization)")
+        print("    • Low QPS = GPU mostly idle = expensive per token")
+        print("    • High QPS = GPU busy with batched requests = cheap per token")
+        print("    • For production: Use the HIGHEST QPS with 99%+ success for best cost")
+        print("\n    📊 Cost metrics count TOTAL tokens (input + output)")
+        print("       Formula: GPU_rate * num_gpus * (1M / total_tokens_per_sec) / 3600")
+        print("="*total_width)
     
     # Print detailed error information
     for result in all_results:
@@ -516,6 +650,15 @@ def save_results(all_results: List[QPSResults], output_file: str):
                 "p95": result.tokens_per_sec_p95,
                 "p99": result.tokens_per_sec_p99,
             },
+            "cost_analysis": {
+                "total_input_tokens": result.total_input_tokens,
+                "total_output_tokens": result.total_output_tokens,
+                "total_tokens": result.total_tokens,
+                "sustained_tokens_per_sec": result.sustained_tokens_per_sec,
+                "gpu_cost": result.gpu_cost,
+                "cost_per_million_tokens": result.cost_per_million_tokens,
+            } if result.cost_per_million_tokens > 0 else None,
+            "actual_duration": result.actual_duration,
             "errors": result.error_counts,
             "status_codes": result.status_codes,
         })
@@ -557,8 +700,16 @@ def plot_results(all_results: List[QPSResults], output_file: str = "benchmark_qp
     tps_p95 = [r.tokens_per_sec_p95 for r in all_results]
     tps_p99 = [r.tokens_per_sec_p99 for r in all_results]
     
-    # Create figure with subplots - always use 3x2 layout to include tokens/sec
-    fig, axes = plt.subplots(3, 2, figsize=(32, 12))
+    # Extract aggregate sustained throughput (output tokens/sec across all requests)
+    sustained_throughput = [r.sustained_tokens_per_sec for r in all_results]
+    
+    # Check if cost data is available
+    has_cost = any(r.cost_per_million_tokens > 0 for r in all_results)
+    costs = [r.cost_per_million_tokens for r in all_results] if has_cost else []
+    
+    # Create figure with subplots - use 4x2 if cost data available, otherwise 3x2
+    num_rows = 4 if has_cost else 3
+    fig, axes = plt.subplots(num_rows, 2, figsize=(32, 12 if not has_cost else 16))
     fig.suptitle('QPS Benchmark Results', fontsize=16, fontweight='bold')
     
     # Plot 1: QPS (Target vs Actual) and Success Rate
@@ -692,23 +843,84 @@ def plot_results(all_results: List[QPSResults], output_file: str = "benchmark_qp
     
     # Plot 5: Tokens/sec - always show this graph
     ax5 = axes[2, 0]
-    ax5.plot(qps_targets, tps_p50, 'o-', color='#06A77D', linewidth=2, 
-             markersize=8, label='P50 (median)')
-    ax5.plot(qps_targets, tps_p90, 'd-', color='#2E86AB', linewidth=2, 
-             markersize=8, label='P90')
-    ax5.plot(qps_targets, tps_p95, 's-', color='#F18F01', linewidth=2, 
-             markersize=8, label='P95')
-    ax5.plot(qps_targets, tps_p99, '^-', color='#C73E1D', linewidth=2, 
-             markersize=8, label='P99')
+    ax5_twin = ax5.twinx()
+    
+    # Per-request percentiles (left y-axis)
+    line1 = ax5.plot(qps_targets, tps_p50, 'o-', color='#06A77D', linewidth=2, 
+                     markersize=8, label='P50 (per-req)')
+    line2 = ax5.plot(qps_targets, tps_p90, 'd-', color='#2E86AB', linewidth=2, 
+                     markersize=8, label='P90 (per-req)')
+    line3 = ax5.plot(qps_targets, tps_p95, 's-', color='#F18F01', linewidth=2, 
+                     markersize=8, label='P95 (per-req)')
+    line4 = ax5.plot(qps_targets, tps_p99, '^-', color='#C73E1D', linewidth=2, 
+                     markersize=8, label='P99 (per-req)')
+    
+    # Aggregate sustained throughput (right y-axis)
+    line5 = ax5_twin.plot(qps_targets, sustained_throughput, 'D-', color='#8B008B', 
+                          linewidth=3, markersize=10, label='Aggregate (all reqs)', 
+                          markeredgewidth=2, markeredgecolor='white')
+    
     ax5.set_xlabel('Target QPS', fontsize=12)
-    ax5.set_ylabel('Tokens per Second', fontsize=12)
-    ax5.set_title('Generation Speed (Tokens/sec)', fontsize=13, fontweight='bold')
-    ax5.legend(loc='upper center', bbox_to_anchor=(0.5, 1.02), framealpha=0.95, edgecolor='black', ncol=4)
+    ax5.set_ylabel('Per-Request Tokens/sec', fontsize=12, color='#06A77D')
+    ax5.tick_params(axis='y', labelcolor='#06A77D')
     ax5.grid(True, alpha=0.3)
     
-    # Hide the 6th subplot in 3x2 grid
-    ax6 = axes[2, 1]
-    ax6.axis('off')
+    # Add padding to top of per-request axis
+    if tps_p99:
+        max_per_req = max(tps_p99)
+        ax5.set_ylim([0, max_per_req * 1.25])
+    
+    ax5_twin.set_ylabel('Aggregate Output Tokens/sec', fontsize=12, color='#8B008B', fontweight='bold')
+    ax5_twin.tick_params(axis='y', labelcolor='#8B008B')
+    
+    # Add padding to top of aggregate axis
+    if sustained_throughput:
+        max_aggregate = max(sustained_throughput)
+        ax5_twin.set_ylim([0, max_aggregate * 1.25])
+    
+    # Combine legends from both axes
+    lines1, labels1 = ax5.get_legend_handles_labels()
+    lines2, labels2 = ax5_twin.get_legend_handles_labels()
+    ax5.legend(lines1 + lines2, labels1 + labels2, loc='upper center', 
+               bbox_to_anchor=(0.5, 1.03), framealpha=0.95, edgecolor='black', ncol=3)
+    
+    ax5.set_title('Generation Speed: Per-Request vs Aggregate', fontsize=13, fontweight='bold')
+    
+    # Plot 6: Cost per Million Tokens (if available)
+    if has_cost:
+        ax6 = axes[2, 1]
+        
+        # Plot cost line
+        ax6.plot(qps_targets, costs, 'o-', color='#8B4789', linewidth=2, 
+                 markersize=8, label='Cost per 1M tokens')
+        
+        # Add markers for success rate context
+        for i, (qps, cost, success) in enumerate(zip(qps_targets, costs, success_rates)):
+            if success < 95:
+                ax6.plot(qps, cost, 'rx', markersize=12, markeredgewidth=2)
+                ax6.annotate(f'{success:.0f}%', (qps, cost), 
+                           textcoords="offset points", xytext=(0,10),
+                           ha='center', fontsize=8, color='red')
+        
+        ax6.set_xlabel('Target QPS', fontsize=12)
+        ax6.set_ylabel('Cost per Million Tokens ($)', fontsize=12)
+        ax6.set_title('Cost per Million Tokens (Input + Output)\n(Based on Total Aggregate Throughput)', 
+                     fontsize=13, fontweight='bold')
+        ax6.legend(loc='upper center', bbox_to_anchor=(0.5, 1.03), framealpha=0.95, edgecolor='black')
+        ax6.grid(True, alpha=0.3)
+        
+        # Add explanatory text
+        ax6.text(0.02, 0.98, '✗ = Success rate < 95% (need more GPUs)', 
+                transform=ax6.transAxes, fontsize=8, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        # Hide empty subplots in 4x2 grid
+        axes[3, 0].axis('off')
+        axes[3, 1].axis('off')
+    else:
+        # Hide the 6th subplot in 3x2 grid
+        ax6 = axes[2, 1]
+        ax6.axis('off')
     
     # Adjust layout to make room for legends above plots
     plt.tight_layout(rect=[0, 0, 1, 0.98])
@@ -876,6 +1088,18 @@ Recommended: Start with low QPS and increase to find your limit.
         help="Show tokens/sec metrics in output table and visualization",
     )
     
+    parser.add_argument(
+        "--gpu-rate",
+        type=float,
+        help="GPU cost per hour (e.g., 2.30 for $2.30/hour). Required for cost calculation.",
+    )
+    
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        help="Number of GPUs used. Required for cost calculation.",
+    )
+    
     args = parser.parse_args()
     
     # Create timestamped results directory
@@ -927,6 +1151,8 @@ Recommended: Start with low QPS and increase to find your limit.
             duration=args.duration,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
+            gpu_rate=args.gpu_rate,
+            num_gpus=args.num_gpus,
         )
         all_results.append(result)
         
@@ -957,7 +1183,8 @@ Recommended: Start with low QPS and increase to find your limit.
         json.dump(metadata, f, indent=2)
     
     # Print and save results
-    print_results_table(all_results, percentiles, args.show_tokens)
+    show_cost = args.gpu_rate is not None and args.num_gpus is not None
+    print_results_table(all_results, percentiles, show_cost)
     save_results(all_results, output_file)
     
     # Generate visualization if requested
