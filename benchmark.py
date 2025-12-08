@@ -196,9 +196,10 @@ async def send_request(
     
     start_time = time.time()
     ttft = None
-    output_tokens = 0
-    input_tokens = None
+    output_tokens = None  # Will be set from API usage data ONLY
+    input_tokens = None   # Will be set from API usage data ONLY
     status_code = None
+    chunk_count = 0  # Count chunks for TTFT only, not for token counting
     
     try:
         async with session.post(endpoint, headers=headers, json=payload, 
@@ -234,7 +235,7 @@ async def send_request(
                     if not chunk:
                         continue
                     
-                    # Check for usage information (some APIs provide this)
+                    # Check for usage information - ONLY source of token counts!
                     if 'usage' in chunk and chunk['usage'] is not None:
                         if 'prompt_tokens' in chunk['usage']:
                             input_tokens = chunk['usage']['prompt_tokens']
@@ -245,19 +246,19 @@ async def send_request(
                         ttft = time.time() - start_time
                         first_token_received = True
                     
+                    # Count chunks for debugging, but DON'T use for token counting
                     if 'choices' in chunk and len(chunk['choices']) > 0:
                         delta = chunk['choices'][0].get('delta', {})
                         if delta and 'content' in delta and delta['content']:
-                            output_tokens += 1
+                            chunk_count += 1
                 
                 except json.JSONDecodeError:
                     continue
             
             total_time = time.time() - start_time
             
-            # Estimate input tokens if not provided
-            if input_tokens is None:
-                input_tokens = estimate_input_tokens(messages)
+            # DO NOT estimate tokens - only use actual API-reported values
+            # If API doesn't provide token counts, leave as None
             
             return RequestMetrics(
                 success=True,
@@ -440,24 +441,49 @@ async def run_qps_test(
     
     # Calculate cost per million tokens if GPU parameters provided
     if gpu_rate is not None and num_gpus is not None:
-        # Count total tokens (input + output) from successful requests
-        total_input = sum(r.input_tokens or 0 for r in successful_results)
-        total_output = sum(r.output_tokens or 0 for r in successful_results)
+        # Count total tokens (input + output) from successful requests that have token data
+        # ONLY count requests where API provided actual token counts
+        requests_with_tokens = [r for r in successful_results 
+                                if r.input_tokens is not None and r.output_tokens is not None]
+        
+        total_input = sum(r.input_tokens for r in requests_with_tokens)
+        total_output = sum(r.output_tokens for r in requests_with_tokens)
         total_tokens = total_input + total_output
         
-        if total_tokens > 0:
-            # Calculate aggregate throughput for ALL tokens (input + output)
-            # Cost is based on total GPU time, which includes:
-            # - Prefill phase: processing input tokens
-            # - Decode phase: generating output tokens
+        print(f"\n📊 Token counting: {len(requests_with_tokens)}/{len(successful_results)} "
+              f"requests had API-reported token counts")
+        
+        if len(requests_with_tokens) < len(successful_results):
+            missing_pct = ((len(successful_results) - len(requests_with_tokens)) / 
+                          len(successful_results) * 100)
+            print(f"   ⚠️  WARNING: {missing_pct:.1f}% of requests missing token data!")
+            print(f"   Cost calculation based only on requests with actual API token counts")
+        
+        if total_tokens > 0 and len(requests_with_tokens) > 0:
+            # For cost calculation: total tokens processed / time
+            # This is the AVERAGE rate at which tokens flowed through the GPU
+            # NOT the same as GPU's max processing capability!
+            #
+            # Example: 3.6M input + 28k output in 30s = 122k avg tokens/sec
+            # This is high because input (prefill) is fast, output (decode) is slow
+            # The GPU spends most actual compute time on the decode phase
+            
             total_tokens_per_second = total_tokens / actual_duration
             
-            # Calculate time needed to process 1M TOTAL tokens at this sustained rate
-            seconds_for_1m_tokens = 1_000_000 / total_tokens_per_second
+            print(f"   ✅ Tokens (API-reported): {total_input:,} input + {total_output:,} output = {total_tokens:,}")
+            print(f"   ⏱️  Test duration: {actual_duration:.1f} seconds")
             
-            # Calculate GPU cost for processing 1M total tokens at this rate
-            # Formula: GPU_rate * num_gpus * (time_in_hours)
-            gpu_cost_for_1m = num_gpus * gpu_rate * (seconds_for_1m_tokens / 3600.0)
+            # Calculate cost per million tokens
+            # Formula: (GPU_rate * num_gpus * duration_hours) * (1M / total_tokens)
+            # This gives: cost to process the tokens we actually processed, scaled to 1M
+            
+            duration_hours = actual_duration / 3600.0
+            cost_for_this_run = num_gpus * gpu_rate * duration_hours
+            cost_per_million = (1_000_000 / total_tokens) * cost_for_this_run
+            
+            print(f"   💰 Cost formula: (${gpu_rate}/hr × {num_gpus} GPU × {duration_hours:.4f}hr) × (1M / {total_tokens:,})")
+            print(f"   💰 Cost for this run: ${cost_for_this_run:.4f}")
+            print(f"   💰 Scaled to 1M tokens: ${cost_per_million:.4f}")
             
             # Also track output-only throughput for system capacity metrics
             output_tokens_per_second = total_output / actual_duration if total_output > 0 else 0
@@ -467,8 +493,8 @@ async def run_qps_test(
             results_obj.total_output_tokens = total_output
             results_obj.total_tokens = total_tokens
             results_obj.sustained_tokens_per_sec = output_tokens_per_second  # Output only for capacity planning
-            results_obj.gpu_cost = num_gpus * gpu_rate * (actual_duration / 3600.0)  # Cost for this run
-            results_obj.cost_per_million_tokens = gpu_cost_for_1m
+            results_obj.gpu_cost = cost_for_this_run  # Cost for this run
+            results_obj.cost_per_million_tokens = cost_per_million
     
     return results_obj
 
@@ -552,10 +578,6 @@ def print_results_table(all_results: List[QPSResults], percentiles: List[int] = 
         
         for result in all_results:
             if result.cost_per_million_tokens and result.cost_per_million_tokens > 0:
-                # Calculate total tokens/sec for cost calculation
-                total_tokens_per_sec = result.total_tokens / result.actual_duration if result.actual_duration > 0 else 0
-                time_for_1m_total = (1_000_000 / total_tokens_per_sec) if total_tokens_per_sec > 0 else 0
-                
                 # Output tokens/sec for capacity planning
                 output_tokens_per_sec = result.sustained_tokens_per_sec
                 
@@ -564,20 +586,34 @@ def print_results_table(all_results: List[QPSResults], percentiles: List[int] = 
                 estimated_max_throughput = 12000  # Conservative estimate for 8B model
                 gpu_utilization = min(100, (output_tokens_per_sec / estimated_max_throughput) * 100)
                 
-                print(f"\nQPS {result.qps_target} ({result.success_rate:.1f}% success):")
-                print(f"  • Input tokens: {result.total_input_tokens:,} | Output tokens: {result.total_output_tokens:,}")
-                print(f"  • Total tokens processed: {result.total_tokens:,}")
-                print(f"  • Aggregate throughput: {total_tokens_per_sec:,.1f} total tokens/sec")
-                print(f"  • Output generation rate: {output_tokens_per_sec:,.1f} output tokens/sec")
-                print(f"  • Estimated GPU utilization: ~{gpu_utilization:.0f}%")
-                print(f"  • Time to process 1M total tokens: {time_for_1m_total/60:.1f} minutes")
-                print(f"  • Cost per 1M total tokens: ${result.cost_per_million_tokens:.4f}")
+                # Show cost calculation breakdown
+                duration_hours = result.actual_duration / 3600.0
                 
-                # Add efficiency notes
-                if gpu_utilization < 20:
-                    print(f"  💡 GPU mostly idle - cost/token is high. Increase QPS for better efficiency.")
-                elif gpu_utilization < 50:
-                    print(f"  💡 GPU underutilized - you could handle more load on this GPU.")
+                print(f"\nQPS {result.qps_target} ({result.success_rate:.1f}% success):")
+                # Calculate input/output ratio
+                input_output_ratio = (result.total_input_tokens / result.total_output_tokens 
+                                     if result.total_output_tokens > 0 else 0)
+                
+                print(f"  📊 Tokens (API-reported):")
+                print(f"     - Input:  {result.total_input_tokens:,}")
+                print(f"     - Output: {result.total_output_tokens:,}")
+                print(f"     - Total:  {result.total_tokens:,}")
+                print(f"     - Ratio:  {input_output_ratio:.1f}:1 (input:output)")
+                if input_output_ratio > 50:
+                    print(f"     ⚠️  Very high input/output ratio - most tokens are context (prefill)")
+                print(f"  📊 Performance:")
+                print(f"     - Output generation rate: {output_tokens_per_sec:,.1f} tokens/sec")
+                print(f"     - Est. GPU utilization: ~{gpu_utilization:.0f}% (based on decode phase)")
+                print(f"  💰 Cost Breakdown:")
+                print(f"     - Test duration: {result.actual_duration:.1f}s ({duration_hours:.4f} hours)")
+                print(f"     - GPU cost for test: ${result.gpu_cost:.4f}")
+                print(f"     - Cost per 1M tokens: ${result.cost_per_million_tokens:.4f}")
+                print(f"     - Formula: (${result.gpu_cost:.4f} ÷ {result.total_tokens:,} tokens) × 1,000,000")
+                
+                # Add efficiency notes based on utilization
+                if gpu_utilization < 20 and result.success_rate >= 99:
+                    print(f"  💡 Low output rate ({output_tokens_per_sec:.0f} tok/s) - GPU may be underutilized.")
+                    print(f"     Consider: increase QPS or use smaller batch/context sizes.")
                 
                 # Add warnings
                 if result.success_rate < 95:
@@ -589,12 +625,14 @@ def print_results_table(all_results: List[QPSResults], percentiles: List[int] = 
         
         print("\n" + "="*total_width)
         print("💡 KEY INSIGHTS:")
-        print("    • Cost per token DECREASES as QPS increases (higher GPU utilization)")
-        print("    • Low QPS = GPU mostly idle = expensive per token")
-        print("    • High QPS = GPU busy with batched requests = cheap per token")
-        print("    • For production: Use the HIGHEST QPS with 99%+ success for best cost")
-        print("\n    📊 Cost metrics count TOTAL tokens (input + output)")
-        print("       Formula: GPU_rate * num_gpus * (1M / total_tokens_per_sec) / 3600")
+        print("    • Cost per token DECREASES as QPS increases (better GPU utilization)")
+        print("    • Low QPS = GPU underutilized = higher cost per token")
+        print("    • High QPS = GPU busy processing batches = lower cost per token")
+        print("    • For production: Use HIGHEST QPS with 99%+ success rate")
+        print("\n    📊 Cost Calculation:")
+        print("       Formula: (GPU_cost_for_run ÷ total_tokens_in_run) × 1,000,000")
+        print("       Tokens: API-reported ONLY (no estimates)")
+        print("       Total = input + output from API 'usage' field")
         print("="*total_width)
     
     # Print detailed error information
@@ -1178,6 +1216,8 @@ Recommended: Start with low QPS and increase to find your limit.
         "temperature": args.temperature,
         "percentiles": percentiles,
         "show_tokens": args.show_tokens,
+        "token_counting": "API-reported only (no estimates)",
+        "cost_calculation": "Total tokens (input + output) from API usage data",
     }
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)

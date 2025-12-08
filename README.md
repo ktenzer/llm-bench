@@ -406,38 +406,58 @@ python benchmark.py \
     --num-gpus 2
 ```
 
-**Cost Calculation Formula (Total Tokens - Input + Output):**
+**Cost Calculation Formula (Simplified and Accurate):**
 
-The benchmark calculates cost based on **total aggregate throughput** (input + output tokens), because the GPU spends time on both:
+The benchmark calculates cost based on **actual API-reported tokens only** (no estimates):
 
-1. **Total tokens** = sum of ALL input + output tokens from successful requests
-2. **Aggregate throughput** = total_tokens / actual_duration_seconds  
-3. **Time to process 1M total tokens** = 1,000,000 / aggregate_throughput
-4. **GPU cost for 1M total tokens** = num_gpus × rate_per_hour × (time_for_1M / 3600)
+1. **Total tokens in run** = sum of input + output tokens from API 'usage' field (successful requests only)
+2. **GPU cost for run** = num_gpus × rate_per_hour × (actual_duration / 3600)
+3. **Cost per 1M tokens** = (GPU_cost_for_run ÷ total_tokens_in_run) × 1,000,000
 
 **Formula in code:**
 ```
-GPU_rate × num_gpus × (1,000,000 / total_tokens_per_sec) / 3600
+cost_per_1m = (num_gpus × GPU_rate × duration_hours) × (1,000,000 / total_tokens)
 ```
 
-This gives you the **real cost per million total tokens**, accounting for actual GPU time spent on both prefill (input) and decode (output).
+**Why this approach?**
+- Simple and accurate: scales the actual cost of your test run to 1M tokens
+- No assumptions about GPU throughput rates
+- Works regardless of input/output ratio
+- Direct proportional scaling
+
+**Important Notes:**
+- Only uses token counts reported by the API in the `usage` field
+- No estimates or approximations
+- If requests lack token data, they're excluded and a warning is shown
+- Works with any input/output ratio (e.g., 130:1 or 1:10)
+
+This gives you the **real cost per million total tokens** based on your actual workload characteristics.
 
 **Example:**
-- Run: 30 seconds at 45 QPS
+- Run: 30 seconds at 40 QPS
 - GPUs: 1 × $2.30/hour
-- Input tokens: 1,890,000
-- Output tokens: 225,000
-- Total tokens: 2,115,000
-- Aggregate throughput: 2,115,000 / 30 = 70,500 total tokens/sec
-- Time for 1M total tokens: 1,000,000 / 70,500 = 14.18 seconds
-- GPU cost for 1M: 1 × 2.30 × (14.18/3600) = **$0.0091** per million total tokens
+- Tokens processed:
+  - Input: 3,659,418 tokens
+  - Output: 28,146 tokens
+  - Total: 3,687,564 tokens
+  - Ratio: 130:1 (input:output)
+
+**Calculation:**
+```
+1. GPU cost for 30-second run:
+   $2.30/hr × 1 GPU × (30s / 3600s) = $0.0192
+
+2. Cost per million tokens:
+   ($0.0192 / 3,687,564 tokens) × 1,000,000 = $0.0052 per million tokens
+```
 
 **Why Count Both Input and Output?**
-- GPU time is spent on BOTH prefill (input) and decode (output) phases
-- Prefill: Processes all input tokens in parallel (fast but still uses GPU time)
-- Decode: Generates output tokens sequentially (slower, token-by-token)
-- Cost reflects total GPU runtime for processing all tokens
-- For production pricing, you typically charge for total tokens (like OpenAI does)
+- GPU spends time on BOTH:
+  - **Prefill** (input): Processes all input tokens in parallel (fast, but uses GPU cycles)
+  - **Decode** (output): Generates output tokens one-by-one (slower, but less total tokens)
+- With a 130:1 input/output ratio, most GPU time is prefill
+- Cost reflects actual GPU runtime for your specific workload
+- This matches how cloud providers charge (total tokens, not just output)
 
 **Why Does Cost Per Token Decrease at Higher QPS?**
 
@@ -454,11 +474,7 @@ This is counter-intuitive but correct! Here's why:
 - At low QPS: GPU processes request → idles 95% of time → next request
 - At high QPS: Requests overlap → GPU batches them → processes tokens continuously
 
-**Production Planning:**
-- ❌ DON'T use cost from low QPS (GPU underutilized, inflated cost)
-- ✅ DO use cost from highest QPS with ≥99% success (realistic utilization)
-
-**⚠️ Important Notes:**
+** Important Notes:**
 - Cost is calculated per million **TOTAL** tokens (input + output combined)
 - Both prefill (input) and decode (output) consume GPU time and contribute to cost
 - If success rate < 95%, the cost assumes you can sustain the measured throughput, but errors indicate you'd need MORE GPUs to reliably handle that rate
@@ -466,9 +482,9 @@ This is counter-intuitive but correct! Here's why:
 - Compare costs at the highest QPS with 99%+ success rate for most accurate production estimates
 
 **Cost is displayed in:**
-- ✅ Console table ($/M Tokens column)
-- ✅ JSON results (cost_analysis section)
-- ✅ Visualization graph (Cost per Million Tokens plot)
+- Console table ($/M Tokens column)
+- JSON results (cost_analysis section)
+- Visualization graph (Cost per Million Tokens plot)
 
 ### Finding Your Optimal Configuration
 
@@ -493,15 +509,15 @@ python benchmark.py \
 Look for the **highest QPS with ≥99% success rate**. Example output:
 
 ```
-QPS 5.0:  ✅ PASS - 100% success, 2,000 total tok/s (~1% GPU util), $4.00/M   ← Too low!
-QPS 10.0: ✅ PASS - 100% success, 12,000 total tok/s (~15% GPU util), $0.67/M
-QPS 30.0: ✅ PASS - 99.5% success, 48,000 total tok/s (~60% GPU util), $0.17/M  ← Good!
-QPS 45.0: ✅ PASS - 99.8% success, 70,500 total tok/s (~88% GPU util), $0.01/M  ← Optimal!
-QPS 50.0: ⚠️  WARN - 92.1% success, 65,000 total tok/s, $0.013/M tokens  ← Saturated!
-QPS 60.0: ❌ FAIL - 45.2% success, 48,000 total tok/s, $0.018/M tokens  ← Overloaded!
+QPS 5.0:  PASS - 100% success, 2,000 total tok/s (~1% GPU util), $4.00/M   ← Too low!
+QPS 10.0: PASS - 100% success, 12,000 total tok/s (~15% GPU util), $0.67/M
+QPS 30.0: PASS - 99.5% success, 48,000 total tok/s (~60% GPU util), $0.17/M  ← Good!
+QPS 45.0: PASS - 99.8% success, 70,500 total tok/s (~88% GPU util), $0.01/M  ← Optimal!
+QPS 50.0:  WARN - 92.1% success, 65,000 total tok/s, $0.013/M tokens  ← Saturated!
+QPS 60.0: FAIL - 45.2% success, 48,000 total tok/s, $0.018/M tokens  ← Overloaded!
 ```
 
-✅ **Use QPS 45.0** for production cost estimates ($0.01/M total tokens with 1 GPU)
+**Use QPS 45.0** for production cost estimates ($0.01/M total tokens with 1 GPU)
 
 **Why not use QPS 5.0 even though it's 100% success?**
 - The GPU is 99% idle, waiting for requests
@@ -579,34 +595,6 @@ High-resolution visualization with large, easy-to-read graphs showing:
 - **Summary and Recommendations** - Optimal QPS, saturation point, guidance
 
 The graphs are sized for clarity (32x12 or 32x16 inches, wide format) with 3x2 layout (standard) or 4x2 layout (with cost). All metrics (TTFT, E2E, Tokens/sec) are always displayed in graphs.
-
-### Comparing Results
-
-To compare multiple runs:
-
-```bash
-# List all results
-ls -lt results/
-
-# View metadata for a specific run
-cat results/2024-11-14_10-30-45/metadata.json
-
-# Compare two runs
-diff results/2024-11-14_10-30-45/benchmark_qps_results.json \
-     results/2024-11-14_11-15-22/benchmark_qps_results.json
-```
-
-### Archiving Results
-
-Old results are never automatically deleted. To clean up:
-
-```bash
-# Keep only recent results (last 7 days)
-find results/ -type d -mtime +7 -exec rm -rf {} +
-
-# Or manually remove specific directories
-rm -rf results/2024-11-14_10-30-45/
-```
 
 ## Understanding Results
 
